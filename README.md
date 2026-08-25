@@ -24,6 +24,7 @@ voice_transform/
 
 `model.safetensors` contains the RVC generator weights plus string metadata for the RVC config and training summary.
 `features.safetensors` contains retrieval vectors as tensor payload. `index.index` is the FAISS index and remains a separate binary file.
+`config.json` includes `model_name`, which is also mirrored into `voice_transform/manifest.json` so the artifact remains identifiable even if it is downloaded into a generic cache or renamed folder.
 
 Legacy `model.pth` and `features.npy` artifacts can still be loaded.
 
@@ -50,6 +51,7 @@ from huggingface_hub_rvc import RVCPipeline
 pipe = RVCPipeline.train(
     identity_dir="identity_audio",
     output_dir="rvc_artifact",
+    model_name="Example Voice",
     training_steps=1000,
     identity_audio_mode="separate",
 )
@@ -59,7 +61,7 @@ pipe.convert_directory("source_audio", "converted_audio")
 ## Save And Push
 
 ```python
-pipe.save_pretrained("rvc_artifact")
+pipe.save_pretrained("rvc_artifact", model_name="Example Voice")
 pipe.push_to_hub("org/rvc-model", folder_path="rvc_artifact")
 ```
 

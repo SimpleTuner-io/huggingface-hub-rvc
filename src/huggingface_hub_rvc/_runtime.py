@@ -203,7 +203,7 @@ def _copy_sidecars(source: Path, destination: Path) -> None:
             shutil.copy2(sidecar, destination.with_suffix(suffix))
 
 
-def _save_model_payload(path: Path, state_dict: Dict[str, torch.Tensor], training: Dict[str, float]) -> None:
+def _save_model_payload(path: Path, state_dict: Dict[str, torch.Tensor], training: Dict[str, float], model_name: Optional[str] = None) -> None:
     metadata = {
         "kind": MODEL_KIND,
         "version": DEFAULT_VERSION,
@@ -212,6 +212,8 @@ def _save_model_payload(path: Path, state_dict: Dict[str, torch.Tensor], trainin
         "config_json": json.dumps(RVC_48K_CONFIG, sort_keys=True),
         "training_json": json.dumps(training, sort_keys=True),
     }
+    if model_name:
+        metadata["model_name"] = model_name
     tensors = {key: value.detach().cpu().contiguous() for key, value in state_dict.items()}
     save_safetensors_file(tensors, str(path), metadata=metadata)
 
@@ -536,21 +538,24 @@ class SimpleRVCTrainer:
         if rank == 0:
             index_path = self._build_index(all_records, cache_dir, model_cfg)
             manifest_path = cache_dir / "manifest.json"
+            voice_model = {
+                "kind": MODEL_KIND,
+                "model_file": MODEL_SAFETENSORS_NAME,
+                "index_file": INDEX_NAME if index_path is not None else None,
+                "features_file": FEATURES_SAFETENSORS_NAME if (cache_dir / FEATURES_SAFETENSORS_NAME).exists() else None,
+                "sample_rate": RVC_48K_CONFIG["data"]["sampling_rate"],
+                "version": DEFAULT_VERSION,
+                "f0": True,
+                "input_count": len(input_paths),
+                "frame_count": int(sum(record.phone.shape[0] for record in all_records)),
+                **train_stats,
+            }
+            if model_cfg.get("model_name"):
+                voice_model["model_name"] = model_cfg["model_name"]
             manifest = {
                 **manifest_base,
                 "fingerprint": fingerprint,
-                "voice_model": {
-                    "kind": MODEL_KIND,
-                    "model_file": MODEL_SAFETENSORS_NAME,
-                    "index_file": INDEX_NAME if index_path is not None else None,
-                    "features_file": FEATURES_SAFETENSORS_NAME if (cache_dir / FEATURES_SAFETENSORS_NAME).exists() else None,
-                    "sample_rate": RVC_48K_CONFIG["data"]["sampling_rate"],
-                    "version": DEFAULT_VERSION,
-                    "f0": True,
-                    "input_count": len(input_paths),
-                    "frame_count": int(sum(record.phone.shape[0] for record in all_records)),
-                    **train_stats,
-                },
+                "voice_model": voice_model,
             }
             manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
             if run_logger is not None:
@@ -776,7 +781,7 @@ class SimpleRVCTrainer:
         is_main = accelerator is None or bool(getattr(accelerator, "is_main_process", True))
         if is_main:
             unwrapped_g = accelerator.unwrap_model(net_g) if accelerator is not None else net_g
-            _save_model_payload(cache_dir / MODEL_SAFETENSORS_NAME, unwrapped_g.cpu().state_dict(), last)
+            _save_model_payload(cache_dir / MODEL_SAFETENSORS_NAME, unwrapped_g.cpu().state_dict(), last, model_name=model_cfg.get("model_name"))
         return last
 
     def _build_index(self, records: List[RVCRecord], cache_dir: Path, model_cfg: Dict[str, Any]) -> Optional[Path]:

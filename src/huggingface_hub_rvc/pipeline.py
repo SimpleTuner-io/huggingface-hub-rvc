@@ -26,12 +26,14 @@ MANIFEST_NAME = "manifest.json"
 VOICE_TRANSFORM_DIR = "voice_transform"
 FORMAT_VERSION = 1
 DEFAULT_MODEL_TYPE = "rvc"
+DEFAULT_MODEL_NAME = "RVC Voice Model"
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
 class RVCConfig:
+    model_name: str = DEFAULT_MODEL_NAME
     model_type: str = DEFAULT_MODEL_TYPE
     format_version: int = FORMAT_VERSION
     architecture: str = "rvc-v2-f0-48k"
@@ -46,7 +48,9 @@ class RVCConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RVCConfig":
         components = data.get("components") or {}
+        metadata = dict(data.get("metadata") or {})
         return cls(
+            model_name=_coerce_model_name(data.get("model_name", data.get("name", metadata.get("model_name")))) or DEFAULT_MODEL_NAME,
             model_type=str(data.get("model_type", data.get("arch_type", DEFAULT_MODEL_TYPE))),
             format_version=int(data.get("format_version", FORMAT_VERSION)),
             architecture=str(data.get("architecture", data.get("arch_version", "rvc-v2-f0-48k"))),
@@ -56,11 +60,12 @@ class RVCConfig:
             index_file=data.get("index_file", components.get("index", INDEX_NAME)),
             features_file=data.get("features_file", components.get("features", FEATURES_SAFETENSORS_NAME)),
             asset_hub_model_id=str(data.get("asset_hub_model_id", DEFAULT_ASSET_REPO)),
-            metadata=dict(data.get("metadata") or {}),
+            metadata=metadata,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "model_name": self.model_name,
             "model_type": self.model_type,
             "format_version": self.format_version,
             "architecture": self.architecture,
@@ -105,6 +110,7 @@ class RVCPipeline:
         self.artifact = artifact
         self.config = config or _config_from_manifest(artifact.manifest)
         self.model_config = {
+            "model_name": self.config.model_name,
             "asset_hub_model_id": self.config.asset_hub_model_id,
             "sample_rate": self.config.sample_rate,
             **(model_config or {}),
@@ -145,7 +151,7 @@ class RVCPipeline:
             )
             if subfolder:
                 root = root / subfolder
-        artifact, config = _load_artifact(root)
+        artifact, config = _load_artifact(root, model_name_fallback=_name_from_repo_id(pretrained_model_name_or_path))
         return cls(artifact=artifact, config=config, model_config=model_config)
 
     @classmethod
@@ -162,6 +168,7 @@ class RVCPipeline:
         device: str | None = None,
         demucs_device: str | None = None,
         asset_hub_model_id: str = DEFAULT_ASSET_REPO,
+        model_name: str | None = None,
         build_index: bool = True,
         progress_callback: ProgressCallback | None = None,
         transform_id: str = "rvc-train",
@@ -169,10 +176,12 @@ class RVCPipeline:
     ) -> "RVCPipeline":
         output_root = Path(output_dir).expanduser()
         cache_dir = output_root / VOICE_TRANSFORM_DIR
+        resolved_model_name = model_name or output_root.name or DEFAULT_MODEL_NAME
         transform_config = {
             "id": transform_id,
             "method": "rvc",
             "model": {
+                "model_name": resolved_model_name,
                 "identity_data_dir": str(Path(identity_dir).expanduser()),
                 "cache_dir": str(cache_dir),
                 "asset_hub_model_id": asset_hub_model_id,
@@ -190,7 +199,7 @@ class RVCPipeline:
             transform_config["model"]["device"] = device
         if demucs_device is not None:
             transform_config["model"]["demucs_device"] = demucs_device
-        manifest_base = _manifest_base("rvc-train", transform_id)
+        manifest_base = _manifest_base("rvc-train", transform_id, model_name=resolved_model_name)
         artifact = SimpleRVCTrainer().train(
             source_backend_config={"id": "identity", "dataset_type": "audio"},
             transform_config=transform_config,
@@ -211,6 +220,7 @@ class RVCPipeline:
         self,
         save_directory: str | Path,
         *,
+        model_name: str | None = None,
         push_to_hub: bool = False,
         repo_id: str | None = None,
         token: bool | str | None = None,
@@ -221,6 +231,13 @@ class RVCPipeline:
         voice_root = save_root / VOICE_TRANSFORM_DIR
         voice_root.mkdir(parents=True, exist_ok=True)
         config = self._resolved_config()
+        config.model_name = (
+            model_name
+            or (config.model_name if config.model_name != DEFAULT_MODEL_NAME else None)
+            or _name_from_repo_id(repo_id)
+            or save_root.name
+            or DEFAULT_MODEL_NAME
+        )
         _copy_if_exists(self.artifact.model_path, voice_root / config.model_file)
         if self.artifact.index_path and config.index_file:
             _copy_if_exists(self.artifact.index_path, voice_root / config.index_file)
@@ -235,8 +252,10 @@ class RVCPipeline:
                 "model_file": config.model_file,
                 "index_file": config.index_file,
                 "features_file": config.features_file,
+                "model_name": config.model_name,
             }
         )
+        manifest["model_name"] = config.model_name
         (voice_root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         (save_root / CONFIG_NAME).write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
         if push_to_hub:
@@ -360,6 +379,7 @@ class RVCPipeline:
         if features_file is None and (self.artifact.cache_dir / FEATURES_NPY_NAME).exists():
             features_file = FEATURES_NPY_NAME
         return RVCConfig(
+            model_name=self.config.model_name,
             sample_rate=self.config.sample_rate,
             f0=self.config.f0,
             model_file=model_file,
@@ -386,7 +406,7 @@ class _SingleFileOutput:
             shutil.rmtree(self.root)
 
 
-def _load_artifact(root: Path) -> tuple[SimpleRVCArtifact, RVCConfig]:
+def _load_artifact(root: Path, model_name_fallback: str | None = None) -> tuple[SimpleRVCArtifact, RVCConfig]:
     config_path = root / CONFIG_NAME
     if (root / VOICE_TRANSFORM_DIR).exists():
         voice_root = root / VOICE_TRANSFORM_DIR
@@ -400,6 +420,8 @@ def _load_artifact(root: Path) -> tuple[SimpleRVCArtifact, RVCConfig]:
         config = RVCConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
     else:
         config = _config_from_manifest(manifest)
+    if config.model_name == DEFAULT_MODEL_NAME:
+        config.model_name = _name_from_manifest(manifest) or model_name_fallback or root.name or DEFAULT_MODEL_NAME
     model_path = _first_existing(voice_root, [config.model_file, MODEL_SAFETENSORS_NAME, MODEL_PTH_NAME])
     index_path = _optional_existing(voice_root, [config.index_file, INDEX_NAME, "*.index"])
     return SimpleRVCArtifact(voice_root, manifest_path, model_path, index_path, manifest), config
@@ -408,6 +430,7 @@ def _load_artifact(root: Path) -> tuple[SimpleRVCArtifact, RVCConfig]:
 def _config_from_manifest(manifest: dict[str, Any]) -> RVCConfig:
     voice_model = manifest.get("voice_model") or {}
     return RVCConfig(
+        model_name=_name_from_manifest(manifest) or DEFAULT_MODEL_NAME,
         sample_rate=int(voice_model.get("sample_rate", 48000)),
         f0=bool(voice_model.get("f0", True)),
         model_file=str(voice_model.get("model_file", MODEL_SAFETENSORS_NAME)),
@@ -416,8 +439,8 @@ def _config_from_manifest(manifest: dict[str, Any]) -> RVCConfig:
     )
 
 
-def _manifest_base(fingerprint: str, transform_id: str) -> dict[str, Any]:
-    return {
+def _manifest_base(fingerprint: str, transform_id: str, model_name: str | None = None) -> dict[str, Any]:
+    manifest = {
         "format": "huggingface-hub-rvc",
         "format_version": FORMAT_VERSION,
         "task": "identity_transfer",
@@ -425,6 +448,31 @@ def _manifest_base(fingerprint: str, transform_id: str) -> dict[str, Any]:
         "fingerprint": fingerprint,
         "transform_id": transform_id,
     }
+    if model_name:
+        manifest["model_name"] = model_name
+    return manifest
+
+
+def _name_from_manifest(manifest: dict[str, Any]) -> str | None:
+    voice_model = manifest.get("voice_model") or {}
+    name = manifest.get("model_name") or voice_model.get("model_name") or voice_model.get("name")
+    return _coerce_model_name(name)
+
+
+def _coerce_model_name(name: Any) -> str | None:
+    if name is None:
+        return None
+    text = str(name).strip()
+    return text or None
+
+
+def _name_from_repo_id(value: str | Path | None) -> str | None:
+    if not value:
+        return None
+    text = str(value).rstrip("/")
+    if not text:
+        return None
+    return text.rsplit("/", 1)[-1] or None
 
 
 def _copy_if_exists(source: Path, destination: Path) -> None:
