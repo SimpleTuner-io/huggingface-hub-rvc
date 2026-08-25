@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "huggingface-hub-rvc"
+version = "0.1.0"
+description = "Hugging Face Hub reader, writer, and runnable pipeline for RVC voice conversion models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "SimpleTuner Contributors" }]
+keywords = ["rvc", "voice-conversion", "huggingface", "safetensors"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = [
+  "huggingface-hub>=0.24",
+  "numpy>=1.24",
+  "packaging>=23",
+  "safetensors>=0.5",
+  "scipy>=1.11",
+  "torch>=2.1",
+  "torchaudio>=2.1",
+  "transformers>=4.40",
+]
+
+[project.optional-dependencies]
+retrieval = ["faiss-cpu>=1.8"]
+separation = ["demucs>=4.0"]
+pitch = ["praat-parselmouth>=0.4.5", "torchcrepe>=0.0.23", "timm>=1.0"]
+inference = ["faiss-cpu>=1.8", "demucs>=4.0", "praat-parselmouth>=0.4.5", "torchcrepe>=0.0.23", "timm>=1.0"]
+train = ["faiss-cpu>=1.8", "demucs>=4.0", "praat-parselmouth>=0.4.5", "torchcrepe>=0.0.23", "timm>=1.0"]
+dev = ["faiss-cpu>=1.8", "demucs>=4.0", "praat-parselmouth>=0.4.5", "torchcrepe>=0.0.23", "timm>=1.0", "pytest>=8", "ruff>=0.8"]
+
+[project.urls]
+Homepage = "https://github.com/SimpleTuner-io/huggingface-hub-rvc"
+Repository = "https://github.com/SimpleTuner-io/huggingface-hub-rvc"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/huggingface_hub_rvc"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
