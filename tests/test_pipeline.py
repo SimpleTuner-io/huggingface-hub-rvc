@@ -71,6 +71,7 @@ def test_save_pretrained_writes_hub_layout():
         pipe.save_pretrained(save_root, model_name="Saved Voice")
 
         assert (save_root / "config.json").exists()
+        assert (save_root / "README.md").exists()
         assert (save_root / "voice_transform" / "manifest.json").exists()
         assert (save_root / "voice_transform" / "model.safetensors").exists()
         assert (save_root / "voice_transform" / "features.safetensors").exists()
@@ -79,6 +80,9 @@ def test_save_pretrained_writes_hub_layout():
         assert config["model_name"] == "Saved Voice"
         assert manifest["model_name"] == "Saved Voice"
         assert manifest["voice_model"]["model_name"] == "Saved Voice"
+        model_card = (save_root / "README.md").read_text(encoding="utf-8")
+        assert "# Saved Voice" in model_card
+        assert "library_name: huggingface-hub-rvc" in model_card
         with safe_open(str(save_root / "voice_transform" / "model.safetensors"), framework="pt", device="cpu") as handle:
             assert handle.metadata()["sample_rate"] == "48000"
 

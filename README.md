@@ -25,6 +25,7 @@ voice_transform/
 `model.safetensors` contains the RVC generator weights plus string metadata for the RVC config and training summary.
 `features.safetensors` contains retrieval vectors as tensor payload. `index.index` is the FAISS index and remains a separate binary file.
 `config.json` includes `model_name`, which is also mirrored into `voice_transform/manifest.json` so the artifact remains identifiable even if it is downloaded into a generic cache or renamed folder.
+`README.md` is generated as a Hub model card when `save_pretrained` writes the artifact.
 
 Legacy `model.pth` and `features.npy` artifacts can still be loaded.
 

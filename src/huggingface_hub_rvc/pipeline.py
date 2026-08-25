@@ -23,6 +23,7 @@ from huggingface_hub_rvc._runtime import (
 
 CONFIG_NAME = "config.json"
 MANIFEST_NAME = "manifest.json"
+MODEL_CARD_NAME = "README.md"
 VOICE_TRANSFORM_DIR = "voice_transform"
 FORMAT_VERSION = 1
 DEFAULT_MODEL_TYPE = "rvc"
@@ -258,6 +259,7 @@ class RVCPipeline:
         manifest["model_name"] = config.model_name
         (voice_root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         (save_root / CONFIG_NAME).write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        (save_root / MODEL_CARD_NAME).write_text(_model_card_text(config, manifest), encoding="utf-8")
         if push_to_hub:
             if repo_id is None:
                 raise ValueError("repo_id is required when push_to_hub=True.")
@@ -274,6 +276,8 @@ class RVCPipeline:
         commit_message: str = "Upload RVC pipeline",
     ) -> Any:
         folder = Path(folder_path).expanduser() if folder_path is not None else self.save_pretrained(Path.cwd() / "rvc-pipeline")
+        if not (folder / MODEL_CARD_NAME).exists():
+            folder = self.save_pretrained(folder)
         api = HfApi(token=token)
         api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=private)
         return api.upload_folder(
@@ -473,6 +477,79 @@ def _name_from_repo_id(value: str | Path | None) -> str | None:
     if not text:
         return None
     return text.rsplit("/", 1)[-1] or None
+
+
+def _model_card_text(config: RVCConfig, manifest: dict[str, Any]) -> str:
+    voice_model = manifest.get("voice_model") or {}
+    lines = [
+        "---",
+        "library_name: huggingface-hub-rvc",
+        "pipeline_tag: audio-to-audio",
+        "tags:",
+        "- rvc",
+        "- voice-conversion",
+        "- safetensors",
+        "---",
+        "",
+        f"# {config.model_name}",
+        "",
+        "This repository contains an RVC voice-conversion artifact saved with `huggingface-hub-rvc`.",
+        "",
+        "## Artifact Layout",
+        "",
+        "```text",
+        "config.json",
+        "voice_transform/",
+        "  manifest.json",
+        f"  {config.model_file}",
+    ]
+    if config.features_file:
+        lines.append(f"  {config.features_file}")
+    if config.index_file:
+        lines.append(f"  {config.index_file}")
+    lines.extend(
+        [
+            "```",
+            "",
+            "## Model Details",
+            "",
+            f"- Model name: `{config.model_name}`",
+            f"- Architecture: `{config.architecture}`",
+            f"- Sample rate: `{config.sample_rate}`",
+            f"- F0 conditioning: `{config.f0}`",
+            f"- Format version: `{config.format_version}`",
+            "",
+            "## Voice Transform",
+            "",
+            f"- Task: `{manifest.get('task', 'identity_transfer')}`",
+            f"- Method: `{manifest.get('method', 'rvc')}`",
+        ]
+    )
+    if voice_model.get("input_count") is not None:
+        lines.append(f"- Identity input files: `{voice_model['input_count']}`")
+    if voice_model.get("frame_count") is not None:
+        lines.append(f"- Indexed/training frames: `{voice_model['frame_count']}`")
+    if voice_model.get("steps") is not None:
+        lines.append(f"- RVC training steps: `{voice_model['steps']}`")
+    lines.extend(
+        [
+            "",
+            "## Usage",
+            "",
+            "```python",
+            "from huggingface_hub_rvc import RVCPipeline",
+            "",
+            "pipe = RVCPipeline.from_pretrained(\"org/model-id\")",
+            "pipe.convert_file(\"input.wav\", \"output.wav\")",
+            "```",
+            "",
+            "## Safety And Rights",
+            "",
+            "Voice-conversion artifacts can encode a singer or speaker identity. Only use or publish this model where you have the required rights and consent.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _copy_if_exists(source: Path, destination: Path) -> None:
