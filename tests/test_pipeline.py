@@ -2,11 +2,13 @@ import json
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 from huggingface_hub_rvc import RVCConfig, RVCPipeline
+from huggingface_hub_rvc._runtime import SimpleRVCConverter
 
 
 def _write_artifact(root: Path, model_name: str | None = None, legacy_config: bool = False) -> Path:
@@ -94,3 +96,132 @@ def test_legacy_config_infers_model_name_from_directory():
         pipe = RVCPipeline.from_pretrained(root, local_files_only=True)
 
         assert pipe.config.model_name == "legacy-voice"
+
+
+def _webui_config(speaker_count: int = 2) -> list:
+    return [
+        1025,
+        32,
+        192,
+        192,
+        768,
+        2,
+        6,
+        3,
+        0,
+        "1",
+        [3, 7, 11],
+        [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+        [12, 10, 2, 2],
+        512,
+        [24, 20, 4, 4],
+        speaker_count,
+        256,
+        48000,
+    ]
+
+
+def test_from_pretrained_inspects_safe_webui_checkpoint():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        checkpoint = Path(temp_dir) / "two-speaker.pth"
+        torch.save(
+            {
+                "weight": {"emb_g.weight": torch.randn(2, 256)},
+                "config": _webui_config(),
+                "version": "v2",
+                "f0": 1,
+                "sr": "48k",
+                "speaker_info": [{"id": 0, "name": "A"}, {"id": 1, "name": "B"}],
+            },
+            checkpoint,
+        )
+
+        pipe = RVCPipeline.from_pretrained(checkpoint, local_files_only=True)
+
+        assert pipe.config.model_name == "two-speaker"
+        assert pipe.config.architecture == "rvc-v2-f0-48000"
+        assert pipe.config.sample_rate == 48000
+        assert pipe.config.metadata["speaker_count"] == 2
+        assert pipe.config.metadata["speaker_info"][1]["name"] == "B"
+
+
+def test_export_webui_is_owned_by_pipeline():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        checkpoint = root / "voice.pth"
+        torch.save(
+            {
+                "weight": {"emb_g.weight": torch.randn(1, 256)},
+                "config": _webui_config(1),
+                "version": "v2",
+                "f0": 1,
+                "sr": "48k",
+            },
+            checkpoint,
+        )
+        pipe = RVCPipeline.from_pretrained(checkpoint, local_files_only=True)
+
+        output = pipe.export_webui(root / "webui", model_name="Test Voice", training_steps=50)
+
+        exported = torch.load(output / "Test-Voice.pth", map_location="cpu", weights_only=True)
+        assert exported["version"] == "v2"
+        assert exported["f0"] == 1
+        assert exported["info"] == "50 training steps"
+
+
+def test_pitch_shift_is_applied_in_semitones():
+    class FakeRMVPE:
+        @staticmethod
+        def infer_from_audio(audio, thred):
+            del thred
+            return np.full(audio.shape[0] // 160, 100.0, dtype=np.float32)
+
+    converter = SimpleRVCConverter()
+    _, continuous = converter._get_f0(
+        np.zeros(1600, dtype=np.float32),
+        10,
+        {"f0_method": "rmvpe", "pitch_shift": 12},
+        torch.device("cpu"),
+        FakeRMVPE(),
+    )
+
+    assert np.allclose(continuous, 200.0)
+
+
+def test_offline_pipeline_preserves_duration_with_context_padding(monkeypatch):
+    monkeypatch.setenv("RVC_CUDA_GRAPH", "0")
+
+    class FakeHubert:
+        @staticmethod
+        def extract(audio, version):
+            assert version == "v2"
+            return torch.ones(max(1, audio.numel() // 320), 768)
+
+    class FakeGenerator(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self.emb_g = torch.nn.Embedding(1, 1)
+
+        def infer(self, phone, lengths, sid):
+            del lengths, sid
+            output = torch.full((1, 1, phone.shape[1] * 160), 0.1, device=phone.device)
+            return output, None, None
+
+    waveform = torch.from_numpy(np.sin(np.linspace(0, 100, 16000 * 2, dtype=np.float32)))
+    converted = SimpleRVCConverter()._convert_waveform(
+        waveform,
+        FakeGenerator(),
+        FakeHubert(),
+        None,
+        None,
+        None,
+        {"is_half": False, "retrieval_strength": 0, "rms_mix_rate": 1},
+        torch.device("cpu"),
+        "v2",
+        False,
+        16000,
+    )
+
+    assert converted.shape == waveform.shape
+    assert torch.allclose(converted, torch.full_like(converted, 0.1))

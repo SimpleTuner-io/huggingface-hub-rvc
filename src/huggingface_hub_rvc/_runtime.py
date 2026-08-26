@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -20,17 +21,24 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy import signal
 from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 from safetensors.torch import save_file as save_safetensors_file
+from scipy import signal
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from huggingface_hub_rvc.core import commons
+from huggingface_hub_rvc.core.cuda_graph import configure_cuda_graph, cuda_graph_enabled, run_cuda_graph
 from huggingface_hub_rvc.core.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 from huggingface_hub_rvc.core.mel_processing import mel_spectrogram_torch, spec_to_mel_torch, spectrogram_torch
-from huggingface_hub_rvc.core.models import MultiPeriodDiscriminatorV2, SynthesizerTrnMs768NSFsid
+from huggingface_hub_rvc.core.models import (
+    MultiPeriodDiscriminatorV2,
+    SynthesizerTrnMs256NSFsid,
+    SynthesizerTrnMs256NSFsid_nono,
+    SynthesizerTrnMs768NSFsid,
+    SynthesizerTrnMs768NSFsid_nono,
+)
 from huggingface_hub_rvc.core.rmvpe import RMVPE
 
 logger = logging.getLogger(__name__)
@@ -47,6 +55,8 @@ FEATURES_NPY_NAME = "features.npy"
 MODEL_KIND = "rvc-v2-f0"
 LEGACY_MODEL_KIND = "simpletuner-rvc-v2-f0"
 FEATURES_KIND = "rvc-features-v1"
+SUPPORTED_F0_METHODS = {"rmvpe", "fcpe", "pm"}
+DEFAULT_PYMSS_MODEL = "model_bs_roformer_ep_368_sdr_12.9628"
 
 RVC_48K_CONFIG: Dict[str, Any] = {
     "train": {
@@ -147,7 +157,12 @@ def _audio_paths(root: Path) -> List[Path]:
     return sorted(path for path in root.rglob("*") if path.suffix.lower() in AUDIO_EXTENSIONS)
 
 
-def _load_audio(path: Path, sample_rate: int, mono: bool = True) -> torch.Tensor:
+def _load_audio(
+    path: Path,
+    sample_rate: int,
+    mono: bool = True,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
     import torchaudio
 
     try:
@@ -179,7 +194,10 @@ def _load_audio(path: Path, sample_rate: int, mono: bool = True) -> torch.Tensor
     if mono and waveform.ndim == 2 and waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if source_rate != sample_rate:
-        waveform = torchaudio.functional.resample(waveform, int(source_rate), sample_rate)
+        target_device = torch.device(device) if device is not None else torch.device("cpu")
+        waveform = torchaudio.functional.resample(
+            waveform.to(device=target_device, dtype=torch.float32), int(source_rate), sample_rate
+        ).cpu()
     if mono:
         return waveform.squeeze(0).to(torch.float32).contiguous()
     return waveform.to(torch.float32).contiguous()
@@ -203,17 +221,30 @@ def _copy_sidecars(source: Path, destination: Path) -> None:
             shutil.copy2(sidecar, destination.with_suffix(suffix))
 
 
-def _save_model_payload(path: Path, state_dict: Dict[str, torch.Tensor], training: Dict[str, float], model_name: Optional[str] = None) -> None:
+def _save_model_payload(
+    path: Path,
+    state_dict: Dict[str, torch.Tensor],
+    training: Dict[str, float],
+    model_name: Optional[str] = None,
+    *,
+    version: str = DEFAULT_VERSION,
+    f0: bool = True,
+    sample_rate: int = 48000,
+    model_config: Any = RVC_48K_CONFIG,
+    speaker_info: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     metadata = {
         "kind": MODEL_KIND,
-        "version": DEFAULT_VERSION,
-        "f0": json.dumps(True),
-        "sample_rate": str(RVC_48K_CONFIG["data"]["sampling_rate"]),
-        "config_json": json.dumps(RVC_48K_CONFIG, sort_keys=True),
+        "version": version,
+        "f0": json.dumps(f0),
+        "sample_rate": str(sample_rate),
+        "config_json": json.dumps(model_config, sort_keys=True),
         "training_json": json.dumps(training, sort_keys=True),
     }
     if model_name:
         metadata["model_name"] = model_name
+    if speaker_info:
+        metadata["speaker_info_json"] = json.dumps(speaker_info, sort_keys=True)
     tensors = {key: value.detach().cpu().contiguous() for key, value in state_dict.items()}
     save_safetensors_file(tensors, str(path), metadata=metadata)
 
@@ -230,8 +261,44 @@ def _load_model_payload(path: Path) -> Dict[str, Any]:
             "config": json.loads(metadata["config_json"]) if metadata.get("config_json") else None,
             "generator_state_dict": load_safetensors_file(str(path), device="cpu"),
             "training": json.loads(metadata["training_json"]) if metadata.get("training_json") else {},
+            "speaker_info": json.loads(metadata["speaker_info_json"]) if metadata.get("speaker_info_json") else [],
         }
-    return torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError("The RVC checkpoint could not be loaded safely with weights_only=True.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("The RVC checkpoint payload must be a dictionary.")
+    if isinstance(payload.get("weight"), dict):
+        config = payload.get("config")
+        sample_rate = _normalize_sample_rate(config[-1] if isinstance(config, (list, tuple)) and config else payload.get("sr"))
+        return {
+            "kind": MODEL_KIND,
+            "version": str(payload.get("version", "v1")).lower(),
+            "f0": bool(payload.get("f0", 1)),
+            "sample_rate": sample_rate,
+            "config": config,
+            "generator_state_dict": payload["weight"],
+            "training": {},
+            "speaker_info": payload.get("speaker_info") or [],
+        }
+    if isinstance(payload.get("generator_state_dict"), dict):
+        return payload
+    raise ValueError("The .pth file is not an RVC inference checkpoint.")
+
+
+def _normalize_sample_rate(value: Any) -> int:
+    text = str(value).strip().lower()
+    aliases = {"32k": 32000, "40k": 40000, "48k": 48000}
+    if text in aliases:
+        return aliases[text]
+    try:
+        sample_rate = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported RVC sample rate: {value!r}") from exc
+    if sample_rate < 16000:
+        raise ValueError(f"Unsupported RVC sample rate: {sample_rate}")
+    return sample_rate
 
 
 def _save_feature_vectors(cache_dir: Path, features: np.ndarray) -> Path:
@@ -279,6 +346,65 @@ def _run_demucs_two_stem(input_path: Path, output_dir: Path, device: str, model_
     if result.returncode != 0:
         raise RuntimeError(f"demucs separation failed for {input_path}: {result.stderr.strip()}")
     return output_dir / model_name / input_path.stem
+
+
+class _PyMSSSeparator:
+    def __init__(self, device: str, model_name: str = DEFAULT_PYMSS_MODEL, model_dir: Optional[Path] = None) -> None:
+        try:
+            from pymss import MSSeparator, load_audio, save_audio
+        except ImportError as exc:
+            raise ImportError("PyMSS separation requires the 'pymss' package.") from exc
+
+        self.load_audio = load_audio
+        self.save_audio = save_audio
+        self.separator = MSSeparator.from_model_name(
+            model_name,
+            model_dir=str(model_dir) if model_dir is not None else None,
+            download=True,
+            source="huggingface",
+            device=device,
+            output_format="wav",
+            store_dirs={},
+            inference_params={"standardize": False, "normalize": False},
+        )
+
+    def separate(self, input_path: Path, output_dir: Path) -> Path:
+        sample_rate = int(self.separator.config.audio.get("sample_rate", 44100))
+        mix, loaded_rate = self.load_audio(str(input_path), sr=sample_rate, mono=False)
+        results = self.separator.separate(mix, pbar=False, stems=["vocals", "instrumental"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        vocals = results.get("vocals")
+        instrumental = results.get("instrumental")
+        if instrumental is None:
+            instrumental = results.get("other")
+        if vocals is None or instrumental is None:
+            raise RuntimeError(f"PyMSS model returned unsupported stems: {sorted(results)}")
+        self.save_audio(str(output_dir / "vocals.wav"), vocals, loaded_rate, "wav", {"wav_bit_depth": "FLOAT"})
+        self.save_audio(
+            str(output_dir / "no_vocals.wav"), instrumental, loaded_rate, "wav", {"wav_bit_depth": "FLOAT"}
+        )
+        return output_dir
+
+    def close(self) -> None:
+        self.separator.close()
+
+
+def _separate_two_stem(
+    input_path: Path,
+    output_dir: Path,
+    *,
+    method: str,
+    device: str,
+    demucs_model: str = "htdemucs",
+    pymss_separator: Optional[_PyMSSSeparator] = None,
+) -> Path:
+    if method == "demucs":
+        return _run_demucs_two_stem(input_path, output_dir, device, demucs_model)
+    if method == "pymss":
+        if pymss_separator is None:
+            raise ValueError("A PyMSS separator must be initialized before separation.")
+        return pymss_separator.separate(input_path, output_dir)
+    raise ValueError("separation_method must be 'pymss' or 'demucs'.")
 
 
 def _coarse_f0(f0: np.ndarray) -> np.ndarray:
@@ -379,20 +505,41 @@ class _HubertFeatureExtractor:
         self.model.eval().requires_grad_(False)
         self.normalize_audio = bool(AutoFeatureExtractor.from_pretrained(str(model_dir), local_files_only=True).do_normalize)
 
-    def extract(self, waveform_16k: torch.Tensor) -> torch.Tensor:
+    def extract(self, waveform_16k: torch.Tensor, version: str = DEFAULT_VERSION) -> torch.Tensor:
+        if version not in {"v1", "v2"}:
+            raise ValueError(f"Unsupported RVC feature version: {version!r}")
         source = waveform_16k.to(device=self.device, dtype=torch.float32)
         if self.normalize_audio:
             source = F.layer_norm(source, source.shape)
         source = source.unsqueeze(0)
         padding_mask = torch.zeros_like(source, dtype=torch.bool)
-        with torch.inference_mode():
+        source = source.half() if self.is_half else source
+        attention_mask = None if not padding_mask.any() else (~padding_mask).long()
+
+        def forward(input_values: torch.Tensor) -> torch.Tensor:
             outputs = self.model(
-                input_values=source.half() if self.is_half else source,
-                attention_mask=None if not padding_mask.any() else (~padding_mask).long(),
-                output_hidden_states=False,
+                input_values=input_values,
+                attention_mask=None,
+                output_hidden_states=version == "v1",
                 return_dict=True,
             )
-        return outputs.last_hidden_state.squeeze(0).float().detach().cpu()
+            return self.model.final_proj(outputs.hidden_states[9]) if version == "v1" else outputs.last_hidden_state
+
+        def forward_masked(input_values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            outputs = self.model(
+                input_values=input_values,
+                attention_mask=mask,
+                output_hidden_states=version == "v1",
+                return_dict=True,
+            )
+            return self.model.final_proj(outputs.hidden_states[9]) if version == "v1" else outputs.last_hidden_state
+
+        with torch.inference_mode():
+            if attention_mask is None:
+                features = run_cuda_graph(self.model, f"hubert-{version}-no-mask", forward, source)
+            else:
+                features = run_cuda_graph(self.model, f"hubert-{version}-mask", forward_masked, source, attention_mask)
+        return features.squeeze(0).float()
 
 
 class _RVCDataset(Dataset):
@@ -465,6 +612,99 @@ def _make_generator(is_half: bool) -> SynthesizerTrnMs768NSFsid:
         is_half=is_half,
         sr=data_cfg["sampling_rate"],
     )
+
+
+def _make_generator_from_payload(payload: Dict[str, Any], is_half: bool) -> torch.nn.Module:
+    version = str(payload.get("version") or DEFAULT_VERSION).lower()
+    if version not in {"v1", "v2"}:
+        raise ValueError(f"Unsupported RVC feature version: {version!r}")
+    f0 = bool(payload.get("f0", True))
+    model_config = payload.get("config")
+    if isinstance(model_config, dict):
+        if version != "v2" or not f0:
+            raise ValueError("Dictionary RVC configs currently require a v2 F0 model.")
+        return _make_generator(is_half=is_half)
+    if not isinstance(model_config, (list, tuple)) or len(model_config) < 18:
+        raise ValueError("The RVC checkpoint is missing a valid generator config.")
+    model_config = list(model_config)
+    speaker_embedding = payload.get("generator_state_dict", {}).get("emb_g.weight")
+    if isinstance(speaker_embedding, torch.Tensor):
+        model_config[-3] = int(speaker_embedding.shape[0])
+    classes = {
+        ("v1", True): SynthesizerTrnMs256NSFsid,
+        ("v1", False): SynthesizerTrnMs256NSFsid_nono,
+        ("v2", True): SynthesizerTrnMs768NSFsid,
+        ("v2", False): SynthesizerTrnMs768NSFsid_nono,
+    }
+    return classes[(version, f0)](*model_config, is_half=is_half)
+
+
+def export_webui_artifact(
+    artifact: SimpleRVCArtifact,
+    output_dir: Path,
+    *,
+    model_name: str,
+    training_steps: Optional[int] = None,
+) -> Path:
+    """Export a portable artifact in the classic RVC WebUI layout."""
+    payload = _load_model_payload(artifact.model_path)
+    state = payload["generator_state_dict"]
+    if "emb_g.weight" not in state:
+        raise ValueError("The RVC generator is missing emb_g.weight.")
+    weights = OrderedDict(
+        (key, value.detach().cpu().half().contiguous()) for key, value in state.items() if not key.startswith("enc_q.")
+    )
+    model_config = payload.get("config")
+    if isinstance(model_config, dict):
+        data_cfg = model_config["data"]
+        model_cfg = model_config["model"]
+        model_config = [
+            data_cfg["filter_length"] // 2 + 1,
+            model_config["train"]["segment_size"] // data_cfg["hop_length"],
+            model_cfg["inter_channels"],
+            model_cfg["hidden_channels"],
+            model_cfg["filter_channels"],
+            model_cfg["n_heads"],
+            model_cfg["n_layers"],
+            model_cfg["kernel_size"],
+            model_cfg["p_dropout"],
+            model_cfg["resblock"],
+            model_cfg["resblock_kernel_sizes"],
+            model_cfg["resblock_dilation_sizes"],
+            model_cfg["upsample_rates"],
+            model_cfg["upsample_initial_channel"],
+            model_cfg["upsample_kernel_sizes"],
+            int(weights["emb_g.weight"].shape[0]),
+            model_cfg["gin_channels"],
+            int(data_cfg["sampling_rate"]),
+        ]
+    else:
+        if not isinstance(model_config, (list, tuple)) or len(model_config) < 18:
+            raise ValueError("The RVC checkpoint is missing a valid generator config and cannot be exported.")
+        model_config = list(model_config)
+        model_config[-3] = int(weights["emb_g.weight"].shape[0])
+    info = f"{training_steps} training steps" if training_steps is not None else "Exported by huggingface-hub-rvc"
+    webui_payload = OrderedDict(
+        weight=weights,
+        config=model_config,
+        info=info,
+        sr=f"{int(payload['sample_rate']) // 1000}k",
+        f0=int(bool(payload.get("f0", True))),
+        version=str(payload.get("version", DEFAULT_VERSION)),
+    )
+    if payload.get("speaker_info"):
+        webui_payload["speaker_info"] = payload["speaker_info"]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    slug = "".join(character if character.isalnum() or character in "._-" else "-" for character in model_name).strip("-._")
+    slug = slug or "rvc-model"
+    torch.save(webui_payload, output_dir / f"{slug}.pth")
+    if artifact.index_path and artifact.index_path.exists():
+        shutil.copy2(artifact.index_path, output_dir / f"added_{slug}_{webui_payload['version']}.index")
+    features = _load_feature_vectors(artifact.index_path) if artifact.index_path else None
+    if features is not None:
+        np.save(output_dir / "total_fea.npy", features)
+    return output_dir
 
 
 class SimpleRVCTrainer:
@@ -598,20 +838,39 @@ class SimpleRVCTrainer:
         hubert = _HubertFeatureExtractor(assets.hubert_dir(), device, is_half)
         rmvpe = RMVPE(str(assets.rmvpe_path()), is_half=is_half, device=str(device))
         records: List[RVCRecord] = []
-        for audio_path in [path for idx, path in enumerate(input_paths) if idx % world_size == rank]:
-            waveform = self._load_identity_audio(audio_path, sample_rate, identity_audio_mode, model_cfg, device)
-            max_samples = int(max_seconds_per_file * sample_rate)
-            if max_samples > 0 and waveform.numel() > max_samples:
-                waveform = waveform[:max_samples]
-            try:
-                record = self._record_from_waveform(waveform, hubert, rmvpe, sample_rate, hop_length)
-            except NoVoicedFramesError:
+        separation_method = str(model_cfg.get("separation_method", "pymss"))
+        pymss_separator = None
+        if identity_audio_mode == "separate" and separation_method == "pymss":
+            pymss_separator = _PyMSSSeparator(
+                str(model_cfg.get("pymss_device", model_cfg.get("demucs_device", _device_arg(device)))),
+                str(model_cfg.get("pymss_model", DEFAULT_PYMSS_MODEL)),
+                Path(model_cfg["pymss_model_dir"]) if model_cfg.get("pymss_model_dir") else None,
+            )
+        try:
+            for audio_path in [path for idx, path in enumerate(input_paths) if idx % world_size == rank]:
+                waveform = self._load_identity_audio(
+                    audio_path,
+                    sample_rate,
+                    identity_audio_mode,
+                    model_cfg,
+                    device,
+                    pymss_separator=pymss_separator,
+                )
+                max_samples = int(max_seconds_per_file * sample_rate)
+                if max_samples > 0 and waveform.numel() > max_samples:
+                    waveform = waveform[:max_samples]
+                try:
+                    record = self._record_from_waveform(waveform, hubert, rmvpe, sample_rate, hop_length)
+                except NoVoicedFramesError:
+                    if run_logger is not None:
+                        run_logger.event(transform_id, "voice_model_feature_skip", path=str(audio_path), reason="no_voiced_frames")
+                    continue
+                records.append(record)
                 if run_logger is not None:
-                    run_logger.event(transform_id, "voice_model_feature_skip", path=str(audio_path), reason="no_voiced_frames")
-                continue
-            records.append(record)
-            if run_logger is not None:
-                run_logger.event(transform_id, "voice_model_feature_extract", path=str(audio_path), frames=record.phone.shape[0])
+                    run_logger.event(transform_id, "voice_model_feature_extract", path=str(audio_path), frames=record.phone.shape[0])
+        finally:
+            if pymss_separator is not None:
+                pymss_separator.close()
         return records
 
     def _record_from_waveform(
@@ -634,8 +893,7 @@ class SimpleRVCTrainer:
             center=False,
         ).squeeze(0).cpu()
         waveform_16k = torchaudio.functional.resample(waveform.unsqueeze(0), sample_rate, 16000).squeeze(0)
-        phone = hubert.extract(waveform_16k)
-        phone = phone.repeat_interleave(2, dim=0)
+        phone = hubert.extract(waveform_16k).repeat_interleave(2, dim=0).float().cpu()
         f0 = _interp_unvoiced(rmvpe.infer_from_audio(waveform_16k.detach().cpu().numpy(), thred=0.03))
         pitch = torch.from_numpy(_coarse_f0(f0)).long()
         pitchf = torch.from_numpy(f0.astype(np.float32))
@@ -655,19 +913,23 @@ class SimpleRVCTrainer:
         identity_audio_mode: str,
         model_cfg: Dict[str, Any],
         device: torch.device,
+        pymss_separator: Optional[_PyMSSSeparator] = None,
     ) -> torch.Tensor:
         if identity_audio_mode in {"vocal_only", "stem", "none"}:
-            return _load_audio(audio_path, sample_rate)
+            return _load_audio(audio_path, sample_rate, device=device)
         if identity_audio_mode != "separate":
             raise ValueError("identity_transfer.model.identity_audio_mode must be 'separate' or 'vocal_only'.")
-        with tempfile.TemporaryDirectory(prefix="hfhub-rvc-identity-demucs-") as tmp_dir:
-            separated_root = _run_demucs_two_stem(
+        separation_method = str(model_cfg.get("separation_method", "pymss"))
+        with tempfile.TemporaryDirectory(prefix="hfhub-rvc-identity-separation-") as tmp_dir:
+            separated_root = _separate_two_stem(
                 audio_path,
                 Path(tmp_dir),
-                str(model_cfg.get("demucs_device", _device_arg(device))),
-                str(model_cfg.get("demucs_model", "htdemucs")),
+                method=separation_method,
+                device=str(model_cfg.get("demucs_device", _device_arg(device))),
+                demucs_model=str(model_cfg.get("demucs_model", "htdemucs")),
+                pymss_separator=pymss_separator,
             )
-            return _load_audio(separated_root / "vocals.wav", sample_rate)
+            return _load_audio(separated_root / "vocals.wav", sample_rate, device=device)
 
     def _load_all_records(self, cache_dir: Path, world_size: int) -> List[RVCRecord]:
         records: List[RVCRecord] = []
@@ -811,7 +1073,7 @@ class SimpleRVCTrainer:
 
 
 class SimpleRVCConverter:
-    """Apply a SimpleTuner RVC artifact to audio files."""
+    """Apply an RVC artifact with upstream-compatible offline inference."""
 
     def convert(
         self,
@@ -830,30 +1092,93 @@ class SimpleRVCConverter:
         if audio_mode not in {"vocal_only", "separate_convert_remix", "full_mix_convert"}:
             raise ValueError(f"Unsupported identity_transfer conversion.audio_mode={audio_mode!r}.")
         device = _get_device(accelerator, conversion_cfg.get("device"))
+        use_cuda_graph = bool(conversion_cfg.get("use_cuda_graph", False))
+        configure_cuda_graph(device, enabled=use_cuda_graph)
         model_payload = _load_model_payload(artifact.model_path)
         if model_payload.get("kind") not in {MODEL_KIND, LEGACY_MODEL_KIND}:
             raise ValueError("identity_transfer found an incompatible RVC artifact. Remove the old rvc_model cache and rerun.")
+        version = str(model_payload.get("version") or DEFAULT_VERSION).lower()
+        if_f0 = bool(model_payload.get("f0", True))
+        target_sample_rate = _normalize_sample_rate(model_payload.get("sample_rate", 48000))
+        f0_method = str(conversion_cfg.get("f0_method", "rmvpe")).lower()
+        if if_f0 and f0_method not in SUPPORTED_F0_METHODS:
+            raise ValueError(f"Unsupported F0 method: {f0_method!r}")
         model_cfg = transform_config.get("model") or {}
         assets = _RVCAssets(artifact.cache_dir, model_cfg)
-        hubert = _HubertFeatureExtractor(assets.hubert_dir(), device, bool(conversion_cfg.get("is_half", device.type == "cuda")))
-        rmvpe = RMVPE(str(assets.rmvpe_path()), is_half=bool(conversion_cfg.get("is_half", device.type == "cuda")), device=str(device))
-        net_g = _make_generator(is_half=bool(conversion_cfg.get("is_half", device.type == "cuda"))).to(device)
-        net_g.load_state_dict(model_payload["generator_state_dict"])
+        is_half = bool(conversion_cfg.get("is_half", device.type == "cuda")) and device.type == "cuda"
+        hubert = _HubertFeatureExtractor(assets.hubert_dir(), device, is_half)
+        rmvpe = None
+        if if_f0 and f0_method == "rmvpe":
+            rmvpe = RMVPE(str(assets.rmvpe_path()), is_half=is_half, device=str(device))
+        net_g = _make_generator_from_payload(model_payload, is_half=is_half)
+        missing, unexpected = net_g.load_state_dict(model_payload["generator_state_dict"], strict=False)
+        invalid_missing = [key for key in missing if not key.startswith("enc_q.")]
+        if invalid_missing or unexpected:
+            raise ValueError(
+                "The RVC generator weights do not match the checkpoint config: "
+                f"missing={invalid_missing[:5]}, unexpected={unexpected[:5]}"
+            )
+        if hasattr(net_g, "enc_q"):
+            del net_g.enc_q
+        net_g = (net_g.half() if is_half else net_g.float()).to(device)
         net_g.eval()
         index, index_vectors = self._load_index(artifact.index_path, conversion_cfg)
+        separation_method = str(conversion_cfg.get("separation_method", "pymss"))
+        pymss_separator = None
+        if audio_mode == "separate_convert_remix" and separation_method == "pymss":
+            pymss_separator = _PyMSSSeparator(
+                str(conversion_cfg.get("pymss_device", conversion_cfg.get("demucs_device", _device_arg(device)))),
+                str(conversion_cfg.get("pymss_model", DEFAULT_PYMSS_MODEL)),
+                Path(conversion_cfg["pymss_model_dir"]) if conversion_cfg.get("pymss_model_dir") else None,
+            )
 
-        for input_name in input_paths:
-            input_path = Path(input_name)
-            output_path = _relative_output_path(source_root, input_path, output_root)
-            if audio_mode == "separate_convert_remix":
-                self._convert_with_demucs(input_path, output_path, net_g, hubert, rmvpe, index, index_vectors, conversion_cfg, device)
-            else:
-                waveform = _load_audio(input_path, RVC_48K_CONFIG["data"]["sampling_rate"])
-                converted = self._convert_waveform(waveform, net_g, hubert, rmvpe, index, index_vectors, conversion_cfg, device)
-                _save_audio(output_path, converted, RVC_48K_CONFIG["data"]["sampling_rate"])
-            _copy_sidecars(input_path, output_path)
-            if run_logger is not None:
-                run_logger.event(transform_config["id"], "conversion_file_complete", source=str(input_path), output=str(output_path))
+        try:
+            for input_name in input_paths:
+                input_path = Path(input_name)
+                output_path = _relative_output_path(source_root, input_path, output_root)
+                if audio_mode == "separate_convert_remix":
+                    self._convert_with_separation(
+                        input_path,
+                        output_path,
+                        net_g,
+                        hubert,
+                        rmvpe,
+                        index,
+                        index_vectors,
+                        conversion_cfg,
+                        device,
+                        version,
+                        if_f0,
+                        target_sample_rate,
+                        separation_method,
+                        pymss_separator,
+                    )
+                else:
+                    waveform_16k = _load_audio(input_path, 16000, device=device)
+                    converted = self._convert_waveform(
+                        waveform_16k,
+                        net_g,
+                        hubert,
+                        rmvpe,
+                        index,
+                        index_vectors,
+                        conversion_cfg,
+                        device,
+                        version,
+                        if_f0,
+                        target_sample_rate,
+                    )
+                    _save_audio(output_path, converted, int(conversion_cfg.get("output_sample_rate", target_sample_rate)))
+                _copy_sidecars(input_path, output_path)
+                if run_logger is not None:
+                    run_logger.event(
+                        transform_config["id"], "conversion_file_complete", source=str(input_path), output=str(output_path)
+                    )
+                if device.type == "cuda" and not cuda_graph_enabled(device):
+                    torch.cuda.empty_cache()
+        finally:
+            if pymss_separator is not None:
+                pymss_separator.close()
 
     def _load_index(self, index_path: Optional[Path], conversion_cfg: Dict[str, Any]):
         index_rate = float(conversion_cfg.get("retrieval_strength", conversion_cfg.get("index_rate", 0.75)))
@@ -869,24 +1194,34 @@ class SimpleRVCConverter:
         index = faiss.read_index(str(index_path))
         return index, index.reconstruct_n(0, index.ntotal)
 
-    def _convert_with_demucs(
+    def _convert_with_separation(
         self,
         input_path: Path,
         output_path: Path,
         net_g: torch.nn.Module,
         hubert: _HubertFeatureExtractor,
-        rmvpe: RMVPE,
+        rmvpe: Optional[RMVPE],
         index: Any,
         index_vectors: Any,
         conversion_cfg: Dict[str, Any],
         device: torch.device,
+        version: str,
+        if_f0: bool,
+        target_sample_rate: int,
+        separation_method: str,
+        pymss_separator: Optional[_PyMSSSeparator],
     ) -> None:
-        if conversion_cfg.get("separation_method", "demucs") != "demucs":
-            raise ValueError("separate_convert_remix requires conversion.separation_method='demucs'.")
-        with tempfile.TemporaryDirectory(prefix="hfhub-rvc-demucs-") as tmp_dir:
-            separated_root = _run_demucs_two_stem(input_path, Path(tmp_dir), str(conversion_cfg.get("demucs_device", _device_arg(device))), str(conversion_cfg.get("demucs_model", "htdemucs")))
+        with tempfile.TemporaryDirectory(prefix="hfhub-rvc-separation-") as tmp_dir:
+            separated_root = _separate_two_stem(
+                input_path,
+                Path(tmp_dir),
+                method=separation_method,
+                device=str(conversion_cfg.get("demucs_device", _device_arg(device))),
+                demucs_model=str(conversion_cfg.get("demucs_model", "htdemucs")),
+                pymss_separator=pymss_separator,
+            )
             converted_vocals = self._convert_waveform(
-                _load_audio(separated_root / "vocals.wav", RVC_48K_CONFIG["data"]["sampling_rate"]),
+                _load_audio(separated_root / "vocals.wav", 16000, device=device),
                 net_g,
                 hubert,
                 rmvpe,
@@ -894,8 +1229,14 @@ class SimpleRVCConverter:
                 index_vectors,
                 conversion_cfg,
                 device,
+                version,
+                if_f0,
+                target_sample_rate,
             )
-            instrumental = _load_audio(separated_root / "no_vocals.wav", RVC_48K_CONFIG["data"]["sampling_rate"], mono=False)
+            output_sample_rate = int(conversion_cfg.get("output_sample_rate", target_sample_rate))
+            instrumental = _load_audio(
+                separated_root / "no_vocals.wav", output_sample_rate, mono=False, device=device
+            )
             length = min(converted_vocals.shape[-1], instrumental.shape[-1])
             vocals = converted_vocals[:length]
             accompaniment = instrumental[..., :length]
@@ -905,25 +1246,138 @@ class SimpleRVCConverter:
             peak = mixed.abs().max()
             if peak > 0.99:
                 mixed = mixed / peak * 0.99
-            _save_audio(output_path, mixed, RVC_48K_CONFIG["data"]["sampling_rate"])
+            _save_audio(output_path, mixed, output_sample_rate)
 
     def _convert_waveform(
         self,
-        waveform: torch.Tensor,
+        waveform_16k: torch.Tensor,
         net_g: torch.nn.Module,
         hubert: _HubertFeatureExtractor,
-        rmvpe: RMVPE,
+        rmvpe: Optional[RMVPE],
         index: Any,
         index_vectors: Any,
         conversion_cfg: Dict[str, Any],
         device: torch.device,
+        version: str,
+        if_f0: bool,
+        target_sample_rate: int,
     ) -> torch.Tensor:
-        import torchaudio
+        filtered = signal.filtfilt(
+            *signal.butter(N=5, Wn=48, btype="high", fs=16000),
+            waveform_16k.detach().cpu().numpy(),
+        ).astype(np.float32)
+        window = 160
+        x_pad = int(conversion_cfg.get("chunk_pad_seconds", 3 if bool(conversion_cfg.get("is_half", device.type == "cuda")) else 1))
+        x_query = int(conversion_cfg.get("chunk_query_seconds", 10 if x_pad == 3 else 6))
+        x_center = int(conversion_cfg.get("chunk_center_seconds", 60 if x_pad == 3 else 38))
+        x_max = int(conversion_cfg.get("chunk_max_seconds", 65 if x_pad == 3 else 41))
+        if x_pad <= 0:
+            raise ValueError("chunk_pad_seconds must be greater than zero.")
+        if min(x_query, x_center, x_max) <= 0 or x_query >= x_center or x_center >= x_max:
+            raise ValueError("RVC chunk bounds must satisfy 0 < query < center < max.")
+        t_pad = 16000 * x_pad
+        t_pad_target = target_sample_rate * x_pad
+        t_pad2 = t_pad * 2
+        t_query = 16000 * x_query
+        t_center = 16000 * x_center
+        t_max = 16000 * x_max
 
-        sr = RVC_48K_CONFIG["data"]["sampling_rate"]
-        waveform_16k = torchaudio.functional.resample(waveform.unsqueeze(0), sr, 16000).squeeze(0)
-        filtered = signal.filtfilt(*signal.butter(N=5, Wn=48, btype="high", fs=16000), waveform_16k.detach().cpu().numpy())
-        phone = hubert.extract(torch.from_numpy(filtered.astype(np.float32))).to(device)
+        split_pad = np.pad(filtered, (window // 2, window // 2), mode="reflect")
+        cut_points: List[int] = []
+        if split_pad.shape[0] > t_max:
+            audio_sum = np.zeros_like(filtered)
+            for offset in range(window):
+                audio_sum += np.abs(split_pad[offset : offset - window])
+            for center in range(t_center, filtered.shape[0], t_center):
+                query = audio_sum[center - t_query : center + t_query]
+                cut_points.append(center - t_query + int(np.argmin(query)))
+
+        audio_pad = np.pad(filtered, (t_pad, t_pad), mode="reflect")
+        p_len = audio_pad.shape[0] // window
+        pitch = pitchf = None
+        if if_f0:
+            pitch_np, pitchf_np = self._get_f0(audio_pad, p_len, conversion_cfg, device, rmvpe)
+            pitch = torch.from_numpy(pitch_np[:p_len]).unsqueeze(0).long().to(device)
+            pitchf = torch.from_numpy(pitchf_np[:p_len]).unsqueeze(0).float().to(device)
+
+        audio_segments: List[torch.Tensor] = []
+        start = 0
+        previous_cut: Optional[int] = None
+        for cut in cut_points:
+            cut = cut // window * window
+            segment_pitch = pitch[:, start // window : (cut + t_pad2) // window] if pitch is not None else None
+            segment_pitchf = pitchf[:, start // window : (cut + t_pad2) // window] if pitchf is not None else None
+            converted = self._convert_segment(
+                audio_pad[start : cut + t_pad2 + window],
+                net_g,
+                hubert,
+                segment_pitch,
+                segment_pitchf,
+                index,
+                index_vectors,
+                conversion_cfg,
+                device,
+                version,
+                if_f0,
+            )
+            audio_segments.append(converted[t_pad_target:-t_pad_target])
+            start = cut
+            previous_cut = cut
+
+        tail_start = previous_cut or 0
+        segment_pitch = pitch[:, tail_start // window :] if pitch is not None else None
+        segment_pitchf = pitchf[:, tail_start // window :] if pitchf is not None else None
+        converted = self._convert_segment(
+            audio_pad[tail_start:],
+            net_g,
+            hubert,
+            segment_pitch,
+            segment_pitchf,
+            index,
+            index_vectors,
+            conversion_cfg,
+            device,
+            version,
+            if_f0,
+        )
+        audio_segments.append(converted[t_pad_target:-t_pad_target])
+        audio = torch.cat(audio_segments)
+
+        rms_mix_rate = float(conversion_cfg.get("rms_mix_rate", 1.0))
+        if not 0 <= rms_mix_rate <= 1:
+            raise ValueError("rms_mix_rate must be between 0 and 1.")
+        if rms_mix_rate != 1:
+            audio = self._change_rms(waveform_16k, 16000, audio, target_sample_rate, rms_mix_rate)
+        output_sample_rate = int(conversion_cfg.get("output_sample_rate", target_sample_rate))
+        if output_sample_rate != target_sample_rate:
+            audio = self._resample_tensor(audio, target_sample_rate, output_sample_rate, device)
+        timbre_strength = conversion_cfg.get("timbre_strength")
+        if timbre_strength is not None and float(timbre_strength) < 1:
+            logger.warning("timbre_strength is deprecated; use rms_mix_rate for upstream-compatible volume-envelope control.")
+            dry = self._resample_tensor(waveform_16k, 16000, output_sample_rate, device)
+            length = min(audio.numel(), dry.numel())
+            audio = dry[:length] * (1 - float(timbre_strength)) + audio[:length] * float(timbre_strength)
+        return audio.float().cpu()
+
+    def _convert_segment(
+        self,
+        audio_16k: np.ndarray,
+        net_g: torch.nn.Module,
+        hubert: _HubertFeatureExtractor,
+        pitch: Optional[torch.Tensor],
+        pitchf: Optional[torch.Tensor],
+        index: Any,
+        index_vectors: Any,
+        conversion_cfg: Dict[str, Any],
+        device: torch.device,
+        version: str,
+        if_f0: bool,
+    ) -> torch.Tensor:
+        phone = hubert.extract(torch.from_numpy(audio_16k), version=version)
+        dtype = torch.float16 if next(net_g.parameters()).dtype == torch.float16 else torch.float32
+        phone = phone.to(device=device, dtype=dtype)
+        protect = float(conversion_cfg.get("protect", 0.33))
+        phone_unretrieved = phone.clone() if protect < 0.5 and pitchf is not None else None
         retrieval_strength = float(conversion_cfg.get("retrieval_strength", conversion_cfg.get("index_rate", 0.75)))
         if index_vectors is not None and retrieval_strength > 0:
             npy = phone.detach().cpu().numpy().astype("float32")
@@ -935,27 +1389,140 @@ class SimpleRVCConverter:
                 weight = np.square(1 / score)
                 weight /= weight.sum(axis=1, keepdims=True)
                 retrieved = np.sum(index_vectors[ix] * np.expand_dims(weight, axis=2), axis=1)
-            phone = torch.from_numpy(retrieved).to(device) * retrieval_strength + phone * (1 - retrieval_strength)
+            phone = torch.from_numpy(retrieved).to(device=device, dtype=dtype) * retrieval_strength + phone * (
+                1 - retrieval_strength
+            )
         phone = F.interpolate(phone.unsqueeze(0).permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
-        p_len = phone.shape[1]
-        f0 = _interp_unvoiced(rmvpe.infer_from_audio(filtered.astype(np.float32), thred=0.03))
-        pitch = torch.from_numpy(_coarse_f0(f0)[:p_len]).unsqueeze(0).long().to(device)
-        pitchf = torch.from_numpy(f0.astype(np.float32)[:p_len]).unsqueeze(0).float().to(device)
-        if pitch.shape[1] < p_len:
-            p_len = pitch.shape[1]
-            phone = phone[:, :p_len]
+        if phone_unretrieved is not None:
+            phone_unretrieved = F.interpolate(phone_unretrieved.unsqueeze(0).permute(0, 2, 1), scale_factor=2).permute(
+                0, 2, 1
+            )
+        p_len = audio_16k.shape[0] // 160
+        p_len = min(p_len, phone.shape[1])
+        if pitch is not None and pitchf is not None:
+            p_len = min(p_len, pitch.shape[1], pitchf.shape[1])
+            pitch = pitch[:, :p_len]
+            pitchf = pitchf[:, :p_len]
+        phone = phone[:, :p_len]
+        if phone_unretrieved is not None and pitchf is not None:
+            phone_unretrieved = phone_unretrieved[:, :p_len]
+            pitch_mask = pitchf.clone()
+            pitch_mask[pitchf > 0] = 1
+            pitch_mask[pitchf < 1] = protect
+            pitch_mask = pitch_mask.unsqueeze(-1).to(dtype=dtype)
+            phone = phone * pitch_mask + phone_unretrieved * (1 - pitch_mask)
         lengths = torch.tensor([p_len], dtype=torch.long, device=device)
-        sid = torch.zeros(1, dtype=torch.long, device=device)
+        speaker_id = int(conversion_cfg.get("speaker_id", 0))
+        if speaker_id < 0 or speaker_id >= net_g.emb_g.num_embeddings:
+            raise ValueError(f"speaker_id must be between 0 and {net_g.emb_g.num_embeddings - 1}.")
+        sid = torch.tensor([speaker_id], dtype=torch.long, device=device)
         with torch.inference_mode():
-            audio = net_g.infer(phone, lengths, pitch, pitchf, sid)[0][0, 0].detach().float().cpu()
-        source_rms = waveform.pow(2).mean().sqrt().clamp_min(EPS)
-        converted_rms = audio.pow(2).mean().sqrt().clamp_min(EPS)
-        audio = audio * (source_rms / converted_rms)
-        strength = float(conversion_cfg.get("timbre_strength", 1.0))
-        if strength < 1.0:
-            length = min(audio.numel(), waveform.numel())
-            audio = waveform[:length] * (1.0 - strength) + audio[:length] * strength
-        return audio[: waveform.numel()]
+            if if_f0:
+                synthesized = run_cuda_graph(
+                    net_g,
+                    "rvc-synth-f0",
+                    lambda features, feature_lengths, coarse, continuous, speaker: net_g.infer(
+                        features, feature_lengths, coarse, continuous, speaker
+                    )[0],
+                    phone,
+                    lengths,
+                    pitch,
+                    pitchf,
+                    sid,
+                )
+            else:
+                synthesized = run_cuda_graph(
+                    net_g,
+                    "rvc-synth-no-f0",
+                    lambda features, feature_lengths, speaker: net_g.infer(features, feature_lengths, speaker)[0],
+                    phone,
+                    lengths,
+                    sid,
+                )
+        return synthesized[0, 0].detach().float().cpu()
+
+    def _get_f0(
+        self,
+        audio_16k: np.ndarray,
+        p_len: int,
+        conversion_cfg: Dict[str, Any],
+        device: torch.device,
+        rmvpe: Optional[RMVPE],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        method = str(conversion_cfg.get("f0_method", "rmvpe")).lower()
+        if method == "rmvpe":
+            if rmvpe is None:
+                raise ValueError("RMVPE was not initialized for f0_method='rmvpe'.")
+            f0 = rmvpe.infer_from_audio(audio_16k, thred=float(conversion_cfg.get("f0_threshold", 0.03)))
+        elif method == "pm":
+            try:
+                import parselmouth
+            except ImportError as exc:
+                raise ImportError("PM pitch extraction requires 'praat-parselmouth'.") from exc
+            f0 = (
+                parselmouth.Sound(audio_16k, 16000)
+                .to_pitch_ac(time_step=0.01, voicing_threshold=0.6, pitch_floor=50, pitch_ceiling=1100)
+                .selected_array["frequency"]
+            )
+        elif method == "fcpe":
+            from huggingface_hub_rvc.core.fcpe import FCPEInfer
+
+            fcpe = getattr(self, "_fcpe", None)
+            if fcpe is None:
+                fcpe = FCPEInfer(device)
+                self._fcpe = fcpe
+            f0 = (
+                fcpe.infer(
+                    torch.from_numpy(audio_16k).unsqueeze(0).float(),
+                    sr=16000,
+                    decoder_mode="local_argmax",
+                    threshold=float(conversion_cfg.get("fcpe_threshold", 0.006)),
+                )
+                .squeeze()
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            )
+        else:
+            raise ValueError(f"Unsupported F0 method: {method!r}")
+        f0 = np.nan_to_num(np.asarray(f0, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if f0.shape[0] < p_len:
+            left = max(0, (p_len - f0.shape[0] + 1) // 2)
+            f0 = np.pad(f0, (left, p_len - f0.shape[0] - left))
+        else:
+            f0 = f0[:p_len]
+        unvoiced = f0 <= 0
+        if unvoiced.any() and not unvoiced.all():
+            f0[unvoiced] = np.interp(np.where(unvoiced)[0], np.where(~unvoiced)[0], f0[~unvoiced])
+        f0 *= pow(2.0, float(conversion_cfg.get("pitch_shift", 0.0)) / 12.0)
+        return _coarse_f0(f0), f0
+
+    @staticmethod
+    def _change_rms(source: torch.Tensor, source_sr: int, converted: torch.Tensor, converted_sr: int, rate: float) -> torch.Tensor:
+        import librosa
+
+        rms_source = librosa.feature.rms(
+            y=source.detach().cpu().numpy(), frame_length=source_sr, hop_length=source_sr // 2
+        )
+        rms_converted = librosa.feature.rms(
+            y=converted.detach().cpu().numpy(), frame_length=converted_sr, hop_length=converted_sr // 2
+        )
+        source_envelope = F.interpolate(torch.from_numpy(rms_source).unsqueeze(0), size=converted.shape[0], mode="linear").squeeze()
+        converted_envelope = F.interpolate(
+            torch.from_numpy(rms_converted).unsqueeze(0), size=converted.shape[0], mode="linear"
+        ).squeeze()
+        converted_envelope = converted_envelope.clamp_min(EPS)
+        return converted * torch.pow(source_envelope.clamp_min(EPS), 1 - rate) * torch.pow(converted_envelope, rate - 1)
+
+    @staticmethod
+    def _resample_tensor(waveform: torch.Tensor, source_sr: int, target_sr: int, device: torch.device) -> torch.Tensor:
+        if source_sr == target_sr:
+            return waveform
+        import torchaudio
+
+        source = waveform.unsqueeze(0).to(device=device, dtype=torch.float32)
+        return torchaudio.functional.resample(source, source_sr, target_sr).squeeze(0).float().cpu()
 
     def _torch_retrieve(self, query: np.ndarray, index_vectors: np.ndarray, device: torch.device) -> np.ndarray:
         keys = torch.from_numpy(index_vectors).to(device=device, dtype=torch.float32)

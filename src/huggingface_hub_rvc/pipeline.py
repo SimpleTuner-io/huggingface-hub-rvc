@@ -4,7 +4,6 @@ import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
 from huggingface_hub import HfApi, snapshot_download
@@ -19,6 +18,8 @@ from huggingface_hub_rvc._runtime import (
     SimpleRVCArtifact,
     SimpleRVCConverter,
     SimpleRVCTrainer,
+    _load_model_payload,
+    export_webui_artifact,
 )
 
 CONFIG_NAME = "config.json"
@@ -130,8 +131,15 @@ class RVCPipeline:
         model_config: dict[str, Any] | None = None,
     ) -> "RVCPipeline":
         source = Path(pretrained_model_name_or_path).expanduser()
+        model_path_override = None
         if source.exists():
-            root = source / subfolder if subfolder else source
+            if source.is_file():
+                if source.suffix.lower() not in {".pth", ".safetensors"}:
+                    raise ValueError("Local RVC model files must use .pth or .safetensors.")
+                model_path_override = source
+                root = source.parent
+            else:
+                root = source / subfolder if subfolder else source
         else:
             root = Path(
                 snapshot_download(
@@ -146,13 +154,18 @@ class RVCPipeline:
                         "*.safetensors",
                         "*.pth",
                         "*.index",
+                        "*.npy",
                         "*.json",
                     ],
                 )
             )
             if subfolder:
                 root = root / subfolder
-        artifact, config = _load_artifact(root, model_name_fallback=_name_from_repo_id(pretrained_model_name_or_path))
+        artifact, config = _load_artifact(
+            root,
+            model_name_fallback=source.stem if model_path_override is not None else _name_from_repo_id(pretrained_model_name_or_path),
+            model_path_override=model_path_override,
+        )
         return cls(artifact=artifact, config=config, model_config=model_config)
 
     @classmethod
@@ -256,6 +269,8 @@ class RVCPipeline:
                 "model_name": config.model_name,
             }
         )
+        if config.metadata.get("speaker_info"):
+            manifest["voice_model"]["speaker_info"] = config.metadata["speaker_info"]
         manifest["model_name"] = config.model_name
         (voice_root / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         (save_root / CONFIG_NAME).write_text(json.dumps(config.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
@@ -287,6 +302,20 @@ class RVCPipeline:
             commit_message=commit_message,
         )
 
+    def export_webui(
+        self,
+        save_directory: str | Path,
+        *,
+        model_name: str | None = None,
+        training_steps: int | None = None,
+    ) -> Path:
+        return export_webui_artifact(
+            self.artifact,
+            Path(save_directory).expanduser(),
+            model_name=model_name or self.config.model_name,
+            training_steps=training_steps,
+        )
+
     def convert_directory(
         self,
         source_dir: str | Path,
@@ -296,7 +325,14 @@ class RVCPipeline:
         device: str | None = None,
         demucs_device: str | None = None,
         retrieval_strength: float = 0.75,
-        timbre_strength: float = 1.0,
+        pitch_shift: float = 0.0,
+        f0_method: str = "rmvpe",
+        protect: float = 0.33,
+        rms_mix_rate: float = 1.0,
+        speaker_id: int = 0,
+        output_sample_rate: int | None = None,
+        separation_method: str = "pymss",
+        use_cuda_graph: bool = False,
         torch_retrieval: bool = True,
         progress_callback: ProgressCallback | None = None,
         **conversion_config: Any,
@@ -314,7 +350,14 @@ class RVCPipeline:
             device=device,
             demucs_device=demucs_device,
             retrieval_strength=retrieval_strength,
-            timbre_strength=timbre_strength,
+            pitch_shift=pitch_shift,
+            f0_method=f0_method,
+            protect=protect,
+            rms_mix_rate=rms_mix_rate,
+            speaker_id=speaker_id,
+            output_sample_rate=output_sample_rate,
+            separation_method=separation_method,
+            use_cuda_graph=use_cuda_graph,
             torch_retrieval=torch_retrieval,
             progress_callback=progress_callback,
             conversion_config=conversion_config,
@@ -349,19 +392,35 @@ class RVCPipeline:
         device: str | None = None,
         demucs_device: str | None = None,
         retrieval_strength: float = 0.75,
-        timbre_strength: float = 1.0,
+        pitch_shift: float = 0.0,
+        f0_method: str = "rmvpe",
+        protect: float = 0.33,
+        rms_mix_rate: float = 1.0,
+        speaker_id: int = 0,
+        output_sample_rate: int | None = None,
+        separation_method: str = "pymss",
+        use_cuda_graph: bool = False,
         torch_retrieval: bool = True,
         progress_callback: ProgressCallback | None = None,
         conversion_config: dict[str, Any] | None = None,
+        **extra_conversion_config: Any,
     ) -> None:
         conversion = {
             "audio_mode": audio_mode,
-            "separation_method": "demucs",
+            "separation_method": separation_method,
             "retrieval_strength": retrieval_strength,
-            "timbre_strength": timbre_strength,
+            "pitch_shift": pitch_shift,
+            "f0_method": f0_method,
+            "protect": protect,
+            "rms_mix_rate": rms_mix_rate,
+            "speaker_id": speaker_id,
+            "use_cuda_graph": use_cuda_graph,
             "torch_retrieval": torch_retrieval,
             **(conversion_config or {}),
+            **extra_conversion_config,
         }
+        if output_sample_rate is not None:
+            conversion["output_sample_rate"] = output_sample_rate
         if device is not None:
             conversion["device"] = device
         if demucs_device is not None:
@@ -384,6 +443,7 @@ class RVCPipeline:
             features_file = FEATURES_NPY_NAME
         return RVCConfig(
             model_name=self.config.model_name,
+            architecture=self.config.architecture,
             sample_rate=self.config.sample_rate,
             f0=self.config.f0,
             model_file=model_file,
@@ -410,7 +470,11 @@ class _SingleFileOutput:
             shutil.rmtree(self.root)
 
 
-def _load_artifact(root: Path, model_name_fallback: str | None = None) -> tuple[SimpleRVCArtifact, RVCConfig]:
+def _load_artifact(
+    root: Path,
+    model_name_fallback: str | None = None,
+    model_path_override: Path | None = None,
+) -> tuple[SimpleRVCArtifact, RVCConfig]:
     config_path = root / CONFIG_NAME
     if (root / VOICE_TRANSFORM_DIR).exists():
         voice_root = root / VOICE_TRANSFORM_DIR
@@ -426,20 +490,38 @@ def _load_artifact(root: Path, model_name_fallback: str | None = None) -> tuple[
         config = _config_from_manifest(manifest)
     if config.model_name == DEFAULT_MODEL_NAME:
         config.model_name = _name_from_manifest(manifest) or model_name_fallback or root.name or DEFAULT_MODEL_NAME
-    model_path = _first_existing(voice_root, [config.model_file, MODEL_SAFETENSORS_NAME, MODEL_PTH_NAME])
+    model_path = model_path_override or _first_existing(
+        voice_root,
+        [config.model_file, MODEL_SAFETENSORS_NAME, MODEL_PTH_NAME, "*.safetensors", "*.pth"],
+    )
     index_path = _optional_existing(voice_root, [config.index_file, INDEX_NAME, "*.index"])
+    payload = _load_model_payload(model_path)
+    config.architecture = f"rvc-{payload.get('version', 'v2')}-{'f0' if payload.get('f0', True) else 'no-f0'}-{payload.get('sample_rate', 48000)}"
+    config.sample_rate = int(payload.get("sample_rate", config.sample_rate))
+    config.f0 = bool(payload.get("f0", config.f0))
+    config.model_file = model_path.name
+    if payload.get("speaker_info"):
+        config.metadata["speaker_info"] = payload["speaker_info"]
+    speaker_embedding = payload.get("generator_state_dict", {}).get("emb_g.weight")
+    if hasattr(speaker_embedding, "shape"):
+        config.metadata["speaker_count"] = int(speaker_embedding.shape[0])
     return SimpleRVCArtifact(voice_root, manifest_path, model_path, index_path, manifest), config
 
 
 def _config_from_manifest(manifest: dict[str, Any]) -> RVCConfig:
     voice_model = manifest.get("voice_model") or {}
+    sample_rate = int(voice_model.get("sample_rate", 48000))
+    version = str(voice_model.get("version", "v2"))
+    f0 = bool(voice_model.get("f0", True))
     return RVCConfig(
         model_name=_name_from_manifest(manifest) or DEFAULT_MODEL_NAME,
-        sample_rate=int(voice_model.get("sample_rate", 48000)),
-        f0=bool(voice_model.get("f0", True)),
+        architecture=f"rvc-{version}-{'f0' if f0 else 'no-f0'}-{sample_rate}",
+        sample_rate=sample_rate,
+        f0=f0,
         model_file=str(voice_model.get("model_file", MODEL_SAFETENSORS_NAME)),
         index_file=voice_model.get("index_file", INDEX_NAME),
         features_file=voice_model.get("features_file", FEATURES_SAFETENSORS_NAME),
+        metadata={"speaker_info": voice_model["speaker_info"]} if voice_model.get("speaker_info") else {},
     )
 
 
