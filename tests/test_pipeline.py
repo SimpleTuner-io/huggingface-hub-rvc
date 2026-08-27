@@ -3,12 +3,13 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 from huggingface_hub_rvc import RVCConfig, RVCPipeline
-from huggingface_hub_rvc._runtime import SimpleRVCConverter
+from huggingface_hub_rvc._runtime import SimpleRVCConverter, SimpleRVCTrainer, _audio_paths
 
 
 def _write_artifact(root: Path, model_name: str | None = None, legacy_config: bool = False) -> Path:
@@ -186,6 +187,113 @@ def test_pitch_shift_is_applied_in_semitones():
     )
 
     assert np.allclose(continuous, 200.0)
+
+
+def test_audio_paths_ignore_macos_sidecars():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "voice.wav").write_bytes(b"wav")
+        (root / "._voice.wav").write_bytes(b"sidecar")
+
+        paths = _audio_paths(root)
+
+        assert paths == [root / "voice.wav"]
+
+
+def test_convert_directory_defaults_to_demucs_and_ignores_sidecars(monkeypatch):
+    captured = {}
+
+    def fake_convert(self, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(SimpleRVCConverter, "convert", fake_convert)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        artifact_root = _write_artifact(root / "artifact")
+        source = root / "source"
+        source.mkdir()
+        (source / "voice.wav").write_bytes(b"wav")
+        (source / "._voice.wav").write_bytes(b"sidecar")
+
+        pipe = RVCPipeline.from_pretrained(artifact_root, local_files_only=True)
+        pipe.convert_directory(source, root / "generated")
+
+    assert captured["transform_config"]["conversion"]["separation_method"] == "demucs"
+    assert [Path(path).name for path in captured["input_paths"]] == ["voice.wav"]
+
+
+def test_pipeline_train_defaults_to_demucs():
+    import inspect
+
+    assert inspect.signature(RVCPipeline.train).parameters["separation_method"].default == "demucs"
+
+
+def test_identity_separation_logs_and_preserves_vocal_stem(monkeypatch):
+    sample_rate = 48000
+    events = []
+
+    class RunLogger:
+        @staticmethod
+        def event(transform_id, event, **payload):
+            events.append({"transform_id": transform_id, "event": event, **payload})
+
+    def fake_separate(input_path, output_dir, **_kwargs):
+        stem_root = output_dir / input_path.stem
+        stem_root.mkdir(parents=True)
+        t = np.linspace(0, 1, sample_rate, endpoint=False, dtype=np.float32)
+        vocals = np.sin(2 * np.pi * 220 * t).astype(np.float32) * 0.25
+        accompaniment = np.sin(2 * np.pi * 80 * t).astype(np.float32) * 0.05
+        sf.write(stem_root / "vocals.wav", vocals, sample_rate)
+        sf.write(stem_root / "no_vocals.wav", accompaniment, sample_rate)
+        return stem_root
+
+    monkeypatch.setattr("huggingface_hub_rvc._runtime._separate_two_stem", fake_separate)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        input_path = root / "mixed.wav"
+        sf.write(input_path, np.zeros(sample_rate, dtype=np.float32), sample_rate)
+        debug_dir = root / "debug"
+
+        waveform = SimpleRVCTrainer()._load_identity_audio(
+            input_path,
+            sample_rate,
+            "separate",
+            {"separation_method": "demucs", "identity_stem_debug_dir": str(debug_dir)},
+            torch.device("cpu"),
+            run_logger=RunLogger(),
+            transform_id="identity-test",
+        )
+
+        assert waveform.numel() == sample_rate
+        assert (debug_dir / "mixed" / "vocals.wav").exists()
+        assert (debug_dir / "mixed" / "no_vocals.wav").exists()
+
+    assert events[0]["event"] == "identity_separation_complete"
+    assert events[0]["separation_method"] == "demucs"
+    assert events[0]["vocals_rms"] > events[0]["accompaniment_rms"]
+
+
+def test_identity_preprocessing_slices_and_normalizes_segments():
+    trainer = SimpleRVCTrainer()
+    sample_rate = 48000
+    waveform = torch.zeros(sample_rate * 8)
+    t = torch.linspace(0, 8, sample_rate * 8)
+    waveform += torch.sin(2 * torch.pi * 220 * t) * 0.1
+
+    segments = trainer._identity_segments(
+        waveform,
+        sample_rate,
+        {
+            "preprocess_clip_seconds": 3.7,
+            "preprocess_overlap_seconds": 0.3,
+            "preprocess_min_segment_seconds": 1.0,
+        },
+    )
+
+    assert len(segments) >= 2
+    assert all(segment.ndim == 1 for segment in segments)
+    assert all(segment.shape[0] <= int(sample_rate * 3.7) for segment in segments)
+    assert all(torch.isfinite(segment).all() for segment in segments)
 
 
 def test_offline_pipeline_preserves_duration_with_context_padding(monkeypatch):

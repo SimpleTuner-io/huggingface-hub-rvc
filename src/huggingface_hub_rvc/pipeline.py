@@ -10,6 +10,7 @@ from huggingface_hub import HfApi, snapshot_download
 
 from huggingface_hub_rvc._runtime import (
     DEFAULT_ASSET_REPO,
+    DEFAULT_SEPARATION_METHOD,
     FEATURES_NPY_NAME,
     FEATURES_SAFETENSORS_NAME,
     INDEX_NAME,
@@ -18,6 +19,7 @@ from huggingface_hub_rvc._runtime import (
     SimpleRVCArtifact,
     SimpleRVCConverter,
     SimpleRVCTrainer,
+    _audio_paths,
     _load_model_payload,
     export_webui_artifact,
 )
@@ -179,6 +181,7 @@ class RVCPipeline:
         learning_rate: float = 1e-4,
         max_seconds_per_file: float = 180.0,
         identity_audio_mode: str = "separate",
+        separation_method: str = DEFAULT_SEPARATION_METHOD,
         device: str | None = None,
         demucs_device: str | None = None,
         asset_hub_model_id: str = DEFAULT_ASSET_REPO,
@@ -201,6 +204,7 @@ class RVCPipeline:
                 "asset_hub_model_id": asset_hub_model_id,
                 "sample_rate": 48000,
                 "identity_audio_mode": identity_audio_mode,
+                "separation_method": separation_method,
                 "training_steps": training_steps,
                 "batch_size": batch_size,
                 "learning_rate": learning_rate,
@@ -331,7 +335,7 @@ class RVCPipeline:
         rms_mix_rate: float = 1.0,
         speaker_id: int = 0,
         output_sample_rate: int | None = None,
-        separation_method: str = "pymss",
+        separation_method: str = DEFAULT_SEPARATION_METHOD,
         use_cuda_graph: bool = False,
         torch_retrieval: bool = True,
         progress_callback: ProgressCallback | None = None,
@@ -339,7 +343,7 @@ class RVCPipeline:
     ) -> list[Path]:
         source_root = Path(source_dir).expanduser()
         output_root = Path(output_dir).expanduser()
-        input_paths = sorted(path for path in source_root.rglob("*") if path.suffix.lower() in {".flac", ".wav", ".mp3", ".ogg", ".m4a", ".aac", ".opus"})
+        input_paths = _audio_paths(source_root)
         if not input_paths:
             raise ValueError(f"No audio files found under {source_root}.")
         self._convert_paths(
@@ -398,7 +402,7 @@ class RVCPipeline:
         rms_mix_rate: float = 1.0,
         speaker_id: int = 0,
         output_sample_rate: int | None = None,
-        separation_method: str = "pymss",
+        separation_method: str = DEFAULT_SEPARATION_METHOD,
         use_cuda_graph: bool = False,
         torch_retrieval: bool = True,
         progress_callback: ProgressCallback | None = None,

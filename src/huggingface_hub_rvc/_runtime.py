@@ -57,6 +57,7 @@ LEGACY_MODEL_KIND = "simpletuner-rvc-v2-f0"
 FEATURES_KIND = "rvc-features-v1"
 SUPPORTED_F0_METHODS = {"rmvpe", "fcpe", "pm"}
 DEFAULT_PYMSS_MODEL = "model_bs_roformer_ep_368_sdr_12.9628"
+DEFAULT_SEPARATION_METHOD = "demucs"
 
 RVC_48K_CONFIG: Dict[str, Any] = {
     "train": {
@@ -154,7 +155,11 @@ def _device_arg(device: torch.device) -> str:
 
 
 def _audio_paths(root: Path) -> List[Path]:
-    return sorted(path for path in root.rglob("*") if path.suffix.lower() in AUDIO_EXTENSIONS)
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not path.name.startswith("._") and path.suffix.lower() in AUDIO_EXTENSIONS
+    )
 
 
 def _load_audio(
@@ -345,7 +350,27 @@ def _run_demucs_two_stem(input_path: Path, output_dir: Path, device: str, model_
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"demucs separation failed for {input_path}: {result.stderr.strip()}")
-    return output_dir / model_name / input_path.stem
+    stem_root = output_dir / model_name / input_path.stem
+    vocals_path = stem_root / "vocals.wav"
+    accompaniment_path = stem_root / "no_vocals.wav"
+    if not vocals_path.exists() or not accompaniment_path.exists():
+        raise RuntimeError(
+            "demucs separation did not produce the expected two-stem output "
+            f"for {input_path}: missing vocals.wav or no_vocals.wav"
+        )
+    return stem_root
+
+
+def _audio_file_stats(path: Path) -> Dict[str, float]:
+    import soundfile as sf
+
+    audio, sample_rate = sf.read(path, always_2d=True)
+    mono = np.mean(audio, axis=1).astype(np.float32, copy=False)
+    return {
+        "duration_seconds": float(mono.shape[0] / sample_rate) if sample_rate else 0.0,
+        "rms": float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0,
+        "peak": float(np.max(np.abs(mono))) if mono.size else 0.0,
+    }
 
 
 class _PyMSSSeparator:
@@ -838,7 +863,7 @@ class SimpleRVCTrainer:
         hubert = _HubertFeatureExtractor(assets.hubert_dir(), device, is_half)
         rmvpe = RMVPE(str(assets.rmvpe_path()), is_half=is_half, device=str(device))
         records: List[RVCRecord] = []
-        separation_method = str(model_cfg.get("separation_method", "pymss"))
+        separation_method = str(model_cfg.get("separation_method", DEFAULT_SEPARATION_METHOD))
         pymss_separator = None
         if identity_audio_mode == "separate" and separation_method == "pymss":
             pymss_separator = _PyMSSSeparator(
@@ -855,23 +880,110 @@ class SimpleRVCTrainer:
                     model_cfg,
                     device,
                     pymss_separator=pymss_separator,
+                    run_logger=run_logger,
+                    transform_id=transform_id,
                 )
                 max_samples = int(max_seconds_per_file * sample_rate)
                 if max_samples > 0 and waveform.numel() > max_samples:
                     waveform = waveform[:max_samples]
-                try:
-                    record = self._record_from_waveform(waveform, hubert, rmvpe, sample_rate, hop_length)
-                except NoVoicedFramesError:
+                for segment_idx, segment in enumerate(self._identity_segments(waveform, sample_rate, model_cfg)):
+                    try:
+                        record = self._record_from_waveform(segment, hubert, rmvpe, sample_rate, hop_length)
+                    except NoVoicedFramesError:
+                        if run_logger is not None:
+                            run_logger.event(
+                                transform_id,
+                                "voice_model_feature_skip",
+                                path=str(audio_path),
+                                segment=segment_idx,
+                                reason="no_voiced_frames",
+                            )
+                        continue
+                    records.append(record)
                     if run_logger is not None:
-                        run_logger.event(transform_id, "voice_model_feature_skip", path=str(audio_path), reason="no_voiced_frames")
-                    continue
-                records.append(record)
-                if run_logger is not None:
-                    run_logger.event(transform_id, "voice_model_feature_extract", path=str(audio_path), frames=record.phone.shape[0])
+                        run_logger.event(
+                            transform_id,
+                            "voice_model_feature_extract",
+                            path=str(audio_path),
+                            segment=segment_idx,
+                            frames=record.phone.shape[0],
+                        )
         finally:
             if pymss_separator is not None:
                 pymss_separator.close()
         return records
+
+    def _identity_segments(
+        self,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        model_cfg: Dict[str, Any],
+    ) -> List[torch.Tensor]:
+        if not bool(model_cfg.get("preprocess_identity_audio", True)):
+            return [waveform.detach().cpu().float().contiguous()]
+        try:
+            import librosa
+        except ImportError as exc:
+            raise ImportError("librosa is required for identity_transfer RVC identity preprocessing.") from exc
+
+        clip_seconds = float(model_cfg.get("preprocess_clip_seconds", 3.7))
+        overlap_seconds = float(model_cfg.get("preprocess_overlap_seconds", 0.3))
+        min_segment_seconds = float(model_cfg.get("preprocess_min_segment_seconds", 1.0))
+        top_db = float(model_cfg.get("preprocess_silence_top_db", 42.0))
+        if clip_seconds <= 0:
+            raise ValueError("identity_transfer.model.preprocess_clip_seconds must be greater than zero.")
+        if overlap_seconds < 0 or overlap_seconds >= clip_seconds:
+            raise ValueError("identity_transfer.model.preprocess_overlap_seconds must be >= 0 and less than clip length.")
+        if min_segment_seconds <= 0:
+            raise ValueError("identity_transfer.model.preprocess_min_segment_seconds must be greater than zero.")
+
+        audio = waveform.detach().cpu().float().numpy()
+        if audio.ndim != 1:
+            audio = np.mean(audio, axis=0).astype(np.float32, copy=False)
+        bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=sample_rate)
+        audio = signal.lfilter(bh, ah, audio).astype(np.float32, copy=False)
+        if audio.size == 0:
+            return []
+
+        intervals = librosa.effects.split(
+            audio,
+            top_db=top_db,
+            frame_length=max(2048, int(sample_rate * 0.03)),
+            hop_length=max(1, int(sample_rate * 0.015)),
+        )
+        if intervals.size == 0:
+            intervals = np.asarray([[0, audio.shape[0]]], dtype=np.int64)
+
+        clip_samples = int(clip_seconds * sample_rate)
+        step_samples = max(1, int((clip_seconds - overlap_seconds) * sample_rate))
+        min_samples = int(min_segment_seconds * sample_rate)
+        segments: List[torch.Tensor] = []
+        for start, end in intervals:
+            chunk = audio[int(start) : int(end)]
+            if chunk.shape[0] < min_samples:
+                continue
+            offset = 0
+            while offset < chunk.shape[0]:
+                piece = chunk[offset : offset + clip_samples]
+                if piece.shape[0] < min_samples:
+                    break
+                normalized = self._normalize_identity_segment(piece)
+                if normalized is not None:
+                    segments.append(torch.from_numpy(normalized).float().contiguous())
+                if offset + clip_samples >= chunk.shape[0]:
+                    break
+                offset += step_samples
+        return segments
+
+    @staticmethod
+    def _normalize_identity_segment(audio: np.ndarray) -> Optional[np.ndarray]:
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if not np.isfinite(peak) or peak <= 0 or peak > 2.5:
+            return None
+        alpha = 0.75
+        max_amp = 0.9
+        normalized = (audio / peak * (max_amp * alpha)) + ((1.0 - alpha) * audio)
+        return normalized.astype(np.float32, copy=False)
 
     def _record_from_waveform(
         self,
@@ -914,12 +1026,14 @@ class SimpleRVCTrainer:
         model_cfg: Dict[str, Any],
         device: torch.device,
         pymss_separator: Optional[_PyMSSSeparator] = None,
+        run_logger: Any = None,
+        transform_id: str = "rvc-identity-transfer",
     ) -> torch.Tensor:
         if identity_audio_mode in {"vocal_only", "stem", "none"}:
             return _load_audio(audio_path, sample_rate, device=device)
         if identity_audio_mode != "separate":
             raise ValueError("identity_transfer.model.identity_audio_mode must be 'separate' or 'vocal_only'.")
-        separation_method = str(model_cfg.get("separation_method", "pymss"))
+        separation_method = str(model_cfg.get("separation_method", DEFAULT_SEPARATION_METHOD))
         with tempfile.TemporaryDirectory(prefix="hfhub-rvc-identity-separation-") as tmp_dir:
             separated_root = _separate_two_stem(
                 audio_path,
@@ -929,6 +1043,30 @@ class SimpleRVCTrainer:
                 demucs_model=str(model_cfg.get("demucs_model", "htdemucs")),
                 pymss_separator=pymss_separator,
             )
+            vocals_path = separated_root / "vocals.wav"
+            accompaniment_path = separated_root / "no_vocals.wav"
+            if run_logger is not None:
+                vocal_stats = _audio_file_stats(vocals_path)
+                accompaniment_stats = _audio_file_stats(accompaniment_path)
+                run_logger.event(
+                    transform_id,
+                    "identity_separation_complete",
+                    path=str(audio_path),
+                    separation_method=separation_method,
+                    vocals_rms=vocal_stats["rms"],
+                    vocals_peak=vocal_stats["peak"],
+                    vocals_duration_seconds=vocal_stats["duration_seconds"],
+                    accompaniment_rms=accompaniment_stats["rms"],
+                    accompaniment_peak=accompaniment_stats["peak"],
+                    accompaniment_duration_seconds=accompaniment_stats["duration_seconds"],
+                )
+            debug_dir = model_cfg.get("identity_stem_debug_dir")
+            if debug_dir:
+                safe_stem = "".join(char if char.isalnum() or char in "._-" else "_" for char in audio_path.stem)
+                target_root = Path(debug_dir).expanduser() / safe_stem
+                target_root.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(vocals_path, target_root / "vocals.wav")
+                shutil.copy2(accompaniment_path, target_root / "no_vocals.wav")
             return _load_audio(separated_root / "vocals.wav", sample_rate, device=device)
 
     def _load_all_records(self, cache_dir: Path, world_size: int) -> List[RVCRecord]:
@@ -1123,7 +1261,7 @@ class SimpleRVCConverter:
         net_g = (net_g.half() if is_half else net_g.float()).to(device)
         net_g.eval()
         index, index_vectors = self._load_index(artifact.index_path, conversion_cfg)
-        separation_method = str(conversion_cfg.get("separation_method", "pymss"))
+        separation_method = str(conversion_cfg.get("separation_method", DEFAULT_SEPARATION_METHOD))
         pymss_separator = None
         if audio_mode == "separate_convert_remix" and separation_method == "pymss":
             pymss_separator = _PyMSSSeparator(
